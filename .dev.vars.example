@@ -1,0 +1,4 @@
+# Local development secrets for Cloudflare Workers
+# Copy this file to .dev.vars and fill in real values.
+
+OPENROUTER_API_KEY=your_openrouter_api_key_here
