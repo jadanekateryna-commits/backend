@@ -15,7 +15,7 @@
 		"nodejs_compat"
 	],
 	"secrets": {
-		"required": ["OPENROUTER_API_KEY"]
+		"required": ["OPENROUTER_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
 	}
 	/**
 	 * Smart Placement

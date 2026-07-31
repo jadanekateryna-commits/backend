@@ -1,110 +1,108 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { askAI } from "./openrouter";
+import {
+	PlanTasksError,
+	handlePlanTasks,
+	parsePlanTasksRequest,
+} from "./planTasks";
+import type { SupabaseConfig } from "./supabase";
 
-type OpenRouterMessage = {
-	role: "system" | "user" | "assistant";
-	content: string;
-};
-
-type OpenRouterChoice = {
-	message?: {
-		content?: string;
-	};
-};
-
-type OpenRouterResponse = {
-	choices?: OpenRouterChoice[];
-	error?: {
-		message?: string;
-	};
-};
-
-async function askAI(question: string, apiKey: string): Promise<string> {
-	const messages: OpenRouterMessage[] = [
-		{
-			role: "system",
-			content: "Ты полезный ассистент. Отвечай кратко и по делу на русском языке.",
-		},
-		{
-			role: "user",
-			content: question,
-		},
-	];
-
-	const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model: "deepseek/deepseek-v4-flash",
-			messages,
-		}),
+function jsonResponse(body: unknown, status: number): Response {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
 	});
+}
 
-	const data = (await response.json()) as OpenRouterResponse;
-	if (!response.ok) {
-		const errorMessage = data?.error?.message ?? "Unknown OpenRouter error";
-		throw new Error(`OpenRouter request failed: ${errorMessage}`);
+function getOpenRouterKey(env: Env): string | null {
+	const key = env.OPENROUTER_API_KEY?.trim();
+	return key || null;
+}
+
+function getSupabaseConfig(env: Env): SupabaseConfig | null {
+	const url = env.SUPABASE_URL?.trim();
+	const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+	if (!url || !serviceRoleKey) {
+		return null;
+	}
+	return { url, serviceRoleKey };
+}
+
+async function handleAsk(request: Request, env: Env): Promise<Response> {
+	const { question } = (await request.json()) as { question?: string };
+	if (!question || !question.trim()) {
+		return jsonResponse({ error: "Field 'question' is required." }, 400);
 	}
 
-	return data?.choices?.[0]?.message?.content?.trim() ?? "Пустой ответ от модели.";
+	const apiKey = getOpenRouterKey(env);
+	if (!apiKey) {
+		return jsonResponse({ error: "OPENROUTER_API_KEY secret is not configured." }, 500);
+	}
+
+	try {
+		const answer = await askAI(question, apiKey);
+		return jsonResponse({ answer }, 200);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "Unknown error";
+		return jsonResponse({ error: message }, 502);
+	}
+}
+
+async function handlePlanTasksRoute(request: Request, env: Env): Promise<Response> {
+	const parsed = parsePlanTasksRequest(await request.json());
+	if (parsed instanceof Response) {
+		return parsed;
+	}
+
+	const openRouterApiKey = getOpenRouterKey(env);
+	if (!openRouterApiKey) {
+		return jsonResponse({ error: "OPENROUTER_API_KEY secret is not configured." }, 500);
+	}
+
+	const supabase = getSupabaseConfig(env);
+	if (!supabase) {
+		return jsonResponse(
+			{
+				error: "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured.",
+			},
+			500,
+		);
+	}
+
+	try {
+		const result = await handlePlanTasks(parsed, openRouterApiKey, supabase);
+		return jsonResponse(result, 200);
+	} catch (error) {
+		if (error instanceof PlanTasksError) {
+			return jsonResponse({ error: error.message }, error.status);
+		}
+
+		const message = error instanceof Error ? error.message : "Unknown error";
+		if (message.includes("Supabase")) {
+			return jsonResponse({ error: message }, 502);
+		}
+
+		return jsonResponse({ error: message }, 502);
+	}
 }
 
 export default {
 	async fetch(request, env): Promise<Response> {
 		if (request.method !== "POST") {
-			return new Response("Use POST /ask with JSON body: {\"question\":\"...\"}", {
-				status: 405,
-			});
-		}
-
-		const url = new URL(request.url);
-		if (url.pathname !== "/ask") {
-			return new Response("Not Found", { status: 404 });
-		}
-
-		const { question } = (await request.json()) as { question?: string };
-		if (!question || !question.trim()) {
-			return new Response(JSON.stringify({ error: "Field 'question' is required." }), {
-				status: 400,
-				headers: { "Content-Type": "application/json" },
-			});
-		}
-
-		const apiKey = (env as Env & { OPENROUTER_API_KEY?: string }).OPENROUTER_API_KEY;
-		if (!apiKey) {
 			return new Response(
-				JSON.stringify({ error: "OPENROUTER_API_KEY secret is not configured." }),
-				{
-					status: 500,
-					headers: { "Content-Type": "application/json" },
-				},
+				'Use POST /ask or POST /plan-tasks with JSON body. Example: {"question":"..."}',
+				{ status: 405 },
 			);
 		}
 
-		try {
-			const answer = await askAI(question, apiKey);
-			return new Response(JSON.stringify({ answer }), {
-				headers: { "Content-Type": "application/json" },
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : "Unknown error";
-			return new Response(JSON.stringify({ error: message }), {
-				status: 502,
-				headers: { "Content-Type": "application/json" },
-			});
+		const url = new URL(request.url);
+		if (url.pathname === "/ask") {
+			return handleAsk(request, env);
 		}
+
+		if (url.pathname === "/plan-tasks") {
+			return handlePlanTasksRoute(request, env);
+		}
+
+		return new Response("Not Found", { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
